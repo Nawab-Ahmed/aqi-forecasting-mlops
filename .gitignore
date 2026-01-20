@@ -1,0 +1,16 @@
+# Python Environment
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Secrets (CRITICAL)
+.env
+
+# Data and Logs
+*.log
+data/
+
+# OS generated files
+.DS_Store
+Thumbs.db
