@@ -1,0 +1,4 @@
+date_range:
+  start_date: "2023-01-01"
+  end_date: "2026-01-22"
+batch_size_days: 10
