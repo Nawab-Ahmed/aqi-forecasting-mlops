@@ -1,39 +1,50 @@
 # scripts/data_health_check.py
-from pymongo import MongoClient
 import os
 from dotenv import load_dotenv
 import pandas as pd
+import matplotlib.pyplot as plt
+from pymongo import MongoClient
 
 load_dotenv()
 
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = "aqi_feature_store"
-COLLECTION_NAME = "raw_aqi_weather_daily"
+COLLECTION_NAME = "raw_aqi_weather_hourly"  # Update for hourly
 
 # Connect to MongoDB
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
-# Load all data into a DataFrame
-data = pd.DataFrame(list(collection.find()))
+# Load data safely (hourly datasets may be huge)
+cursor = collection.find({}, batch_size=1000)
+data = pd.DataFrame(list(cursor))
 
 if data.empty:
-    print("No data found in MongoDB!")
+    print("❌ No data found in MongoDB!")
 else:
-    # 1️⃣ Total records
-    print(f"Total records: {len(data)}\n")
+    print(f"✅ Total records: {len(data)}\n")
 
-    # 2️⃣ Records per city
+    # Convert dates safely
+    data['date'] = pd.to_datetime(data['date'], errors='coerce')
+
+    # Records per city
     print("Records per city:")
     print(data['city'].value_counts(), "\n")
 
-    # 3️⃣ Check missing/null values
-    print("Null counts:")
-    print(data.isnull().sum(), "\n")
+    # Missing values per city
+    print("Missing values per city:")
+    print(data.groupby('city').apply(lambda x: x.isnull().sum()), "\n")
 
-    # 4️⃣ Date coverage per city
+    # Duplicates
+    print("Duplicate records (city + date):", data.duplicated(subset=['city', 'date']).sum(), "\n")
+
+    # Date coverage per city
     print("Date range per city:")
     for city in data['city'].unique():
-        city_dates = pd.to_datetime(data[data['city'] == city]['date'])
-        print(f"{city}: {city_dates.min().date()} → {city_dates.max().date()}")
+        city_dates = data[data['city'] == city]['date']
+        print(f"{city}: {city_dates.min()} → {city_dates.max()}")
+
+    # Optional plot
+    data['city'].value_counts().plot(kind='bar', title="Records per City")
+    plt.show()

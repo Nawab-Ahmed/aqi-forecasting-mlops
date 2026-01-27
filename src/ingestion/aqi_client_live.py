@@ -1,49 +1,79 @@
+from typing import Dict, Any
+from datetime import datetime, timezone
 import requests
-import os
-from dotenv import load_dotenv
-from time import sleep
-from datetime import datetime
 
-load_dotenv()
-IQAIR_API_KEY = os.getenv("IQAIR_API_KEY")
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
-def fetch_aqi(city: str, state: str = "Sindh", country: str = "Pakistan",
-              retries: int = 5, backoff_factor: int = 2,
-              initial_wait: int = 5, max_wait: int = 60) -> dict:
+class AQICNLiveClient:
     """
-    Fetch current AQI from IQAir with retries and exponential backoff.
-    Returns a dict with 'aqi_avg', 'aqi_min', 'aqi_max', 'timestamp'.
+    Fetches current AQI data for a city from AQICN
     """
-    url = f"https://api.airvisual.com/v2/city?city={city}&state={state}&country={country}&key={IQAIR_API_KEY}"
-    wait_time = initial_wait
 
-    for attempt in range(1, retries + 1):
+    BASE_URL = "https://api.waqi.info/feed"
+
+    def __init__(self, token: str, city: str):
+        self.token = token
+        self.city = city.lower()
+
+    def fetch(self) -> Dict[str, Any]:
+        """
+        Fetch current AQI data and normalize schema.
+        """
+        url = f"{self.BASE_URL}/{self.city}/"
+        params = {"token": self.token}
+
+        logger.info("Fetching live AQI data", extra={"city": self.city})
+
         try:
-            response = requests.get(url, timeout=10)
-
-            if response.status_code == 429:
-                print(f"[AQI] Rate limit hit. Waiting {wait_time}s...")
-                sleep(wait_time)
-                wait_time = min(wait_time * backoff_factor, max_wait)
-                continue
-
+            response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
-            pollution = response.json().get("data", {}).get("current", {}).get("pollution", {})
-
-            if not pollution:
-                return {"aqi_avg": None, "aqi_min": None, "aqi_max": None, "timestamp": datetime.utcnow().isoformat()}
-
-            return {
-                "aqi_avg": pollution.get("aqius"),
-                "aqi_min": None,
-                "aqi_max": None,
-                "timestamp": datetime.utcnow().isoformat()
-            }
+            payload = response.json()
 
         except requests.RequestException as e:
-            print(f"[AQI] Attempt {attempt} failed: {e}. Retrying in {wait_time}s...")
-            sleep(wait_time)
-            wait_time = min(wait_time * backoff_factor, max_wait)
+            logger.error("AQICN request failed", exc_info=True)
+            raise RuntimeError("AQICN API request failed") from e
 
-    return {"aqi_avg": None, "aqi_min": None, "aqi_max": None, "timestamp": datetime.utcnow().isoformat()}
+        if payload.get("status") != "ok":
+            logger.error("AQICN returned non-ok status", extra={"payload": payload})
+            raise ValueError("Invalid AQICN response")
+
+        return self._normalize(payload["data"])
+
+    def _normalize(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize AQICN payload into canonical schema.
+        """
+        time_info = data["time"]["iso"]
+        event_time = (
+            datetime.fromisoformat(time_info.replace("Z", "+00:00"))
+            .astimezone(timezone.utc)
+        )
+
+        pollutants = {
+            key: value.get("v")
+            for key, value in data.get("iaqi", {}).items()
+        }
+
+        normalized = {
+            "city": self.city,
+            "aqi": data.get("aqi"),
+            "dominant_pollutant": data.get("dominentpol"),
+            "pollutants": pollutants,
+            "event_timestamp": event_time,
+            "ingested_at": datetime.now(timezone.utc),
+            "source": "aqicn"
+        }
+
+        logger.info(
+            "Live AQI normalized",
+            extra={
+                "city": self.city,
+                "aqi": normalized["aqi"],
+                "event_timestamp": event_time.isoformat()
+            }
+        )
+
+        return normalized
