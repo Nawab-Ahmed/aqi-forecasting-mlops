@@ -10,12 +10,10 @@ IQAIR_API_KEY = os.getenv("IQAIR_API_KEY")
 
 def fetch_aqi(city: str, state: str = "Sindh", country: str = "Pakistan",
               retries: int = 5, backoff_factor: int = 2,
-              initial_wait: int = 5, max_wait: int = 60):
+              initial_wait: int = 5, max_wait: int = 60) -> dict:
     """
-    Robust AQI fetch:
-    - Handles rate limit (429)
-    - Exponential backoff
-    - Returns structured dict
+    Fetch current AQI from IQAir with retries and exponential backoff.
+    Returns a dict with 'aqi_avg', 'aqi_min', 'aqi_max', 'timestamp'.
     """
     url = f"https://api.airvisual.com/v2/city?city={city}&state={state}&country={country}&key={IQAIR_API_KEY}"
     wait_time = initial_wait
@@ -24,31 +22,28 @@ def fetch_aqi(city: str, state: str = "Sindh", country: str = "Pakistan",
         try:
             response = requests.get(url, timeout=10)
 
-            # Handle rate limit
             if response.status_code == 429:
-                print(f"[AQI] Rate limit hit for {city}. Waiting {wait_time}s...")
+                print(f"[AQI] Rate limit hit. Waiting {wait_time}s...")
                 sleep(wait_time)
                 wait_time = min(wait_time * backoff_factor, max_wait)
                 continue
 
             response.raise_for_status()
-            data = response.json().get("data", {}).get("current", {}).get("pollution", {})
+            pollution = response.json().get("data", {}).get("current", {}).get("pollution", {})
 
-            if not data:
-                print(f"[AQI] No data returned for {city}.")
-                return {"aqi_avg": None, "aqi_min": None, "aqi_max": None, "timestamp": None}
+            if not pollution:
+                return {"aqi_avg": None, "aqi_min": None, "aqi_max": None, "timestamp": datetime.utcnow().isoformat()}
 
             return {
-                "aqi_avg": data.get("aqius"),
+                "aqi_avg": pollution.get("aqius"),
                 "aqi_min": None,
                 "aqi_max": None,
-                "timestamp": datetime.utcnow()
+                "timestamp": datetime.utcnow().isoformat()
             }
 
         except requests.RequestException as e:
-            print(f"[AQI] Attempt {attempt} failed for {city}: {e}. Retrying in {wait_time}s...")
+            print(f"[AQI] Attempt {attempt} failed: {e}. Retrying in {wait_time}s...")
             sleep(wait_time)
             wait_time = min(wait_time * backoff_factor, max_wait)
 
-    print(f"[AQI] Permanent failure for {city} after {retries} attempts.")
-    return {"aqi_avg": None, "aqi_min": None, "aqi_max": None, "timestamp": None}
+    return {"aqi_avg": None, "aqi_min": None, "aqi_max": None, "timestamp": datetime.utcnow().isoformat()}

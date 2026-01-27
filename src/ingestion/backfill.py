@@ -1,74 +1,61 @@
 from datetime import datetime, timedelta
-from storage.mongo import MongoHandler
-from ingestion.weather_client import fetch_weather_batch
-from ingestion.aqi_client import fetch_aqi
+from mongo import MongoHandler
+from hourly_weather_client import fetch_weather_hourly
+from ingestion.aqi_client_live import fetch_aqi
 import os
 from dotenv import load_dotenv
 from time import sleep
 
 load_dotenv()
 
-CITY = os.getenv("CITY")
-STATE = os.getenv("STATE")
-COUNTRY = os.getenv("COUNTRY")
-LATITUDE = float(os.getenv("LATITUDE"))
-LONGITUDE = float(os.getenv("LONGITUDE"))
+CITY = os.getenv("CITY", "Karachi")
+STATE = os.getenv("STATE", "Sindh")
+COUNTRY = os.getenv("COUNTRY", "Pakistan")
+LATITUDE = float(os.getenv("LATITUDE", 24.8607))
+LONGITUDE = float(os.getenv("LONGITUDE", 67.0011))
 
 mongo = MongoHandler()
 
-def run_backfill(start_date: str, end_date: str, batch_size: int = 10):
+
+def run_hourly_backfill(start_date: str, end_date: str):
     """
-    Production-ready sequential backfill:
-    - Fetch weather in batches
-    - Fetch AQI per day with retries
-    - Skip duplicates
-    - Upsert into MongoDB
+    Fetch hourly weather + AQI data and upsert into MongoDB
     """
     start = datetime.strptime(start_date, "%Y-%m-%d")
     end = datetime.strptime(end_date, "%Y-%m-%d")
     current = start
 
-    try:
-        while current <= end:
-            batch_end = min(current + timedelta(days=batch_size - 1), end)
-            print(f"[Backfill] Fetching batch: {current.date()} → {batch_end.date()}")
+    while current <= end:
+        day_str = current.strftime("%Y-%m-%d")
+        print(f"[Backfill] Fetching {CITY} hourly data for {day_str}")
 
-            # Fetch weather batch
-            weather_batch = fetch_weather_batch(
-                LATITUDE,
-                LONGITUDE,
-                current.strftime("%Y-%m-%d"),
-                batch_end.strftime("%Y-%m-%d")
-            )
+        # 1️⃣ Fetch hourly weather
+        weather_data = fetch_weather_hourly(LATITUDE, LONGITUDE, start_date=day_str, end_date=day_str)
 
-            for day in weather_batch:
-                # Skip if record already exists
-                existing = mongo.get_record(CITY, day["date"])
-                if existing and existing.get("aqi_avg") is not None:
-                    print(f"[Mongo] Skipping {CITY} on {day['date']} (already exists)")
-                    continue
+        # 2️⃣ Merge AQI from IQAir for the day
+        aqi_data = fetch_aqi(CITY, STATE, COUNTRY)
 
-                # Fetch AQI with retries
-                aqi_data = fetch_aqi(CITY, STATE, COUNTRY)
+        # 3️⃣ Combine weather + AQI
+        records_to_upsert = []
+        for hour_record in weather_data:
+            record = {
+                "city": CITY,
+                **hour_record,
+                **aqi_data,
+                "source_aqi": "IQAir",
+                "source_weather": "Open-Meteo",
+                "created_at": datetime.utcnow().isoformat()
+            }
+            records_to_upsert.append(record)
 
-                # Build record
-                record = {
-                    "city": CITY,
-                    "date": day["date"],
-                    **day,
-                    **aqi_data,
-                    "source_aqi": "IQAir",
-                    "source_weather": "Open-Meteo",
-                    "created_at": datetime.utcnow()
-                }
+        # 4️⃣ Upsert batch
+        mongo.upsert_records(records_to_upsert)
 
-                # Upsert into MongoDB
-                mongo.upsert_record(record)
+        # Sleep between days to respect API limits
+        sleep(1)
+        current += timedelta(days=1)
 
-                # Sleep to respect rate limits
-                sleep(1.5)
 
-            current = batch_end + timedelta(days=1)
-
-    except KeyboardInterrupt:
-        print("\n[Backfill] Interrupted by user. Exiting safely...")
+if __name__ == "__main__":
+    # Example: backfill last 7 days
+    run_hourly_backfill("2025-01-20", "2025-01-26")
