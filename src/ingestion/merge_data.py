@@ -1,6 +1,14 @@
+import sys
+import os
+
+# Add project root to sys.path
+CURRENT_DIR = os.getcwd()  # or use notebook's __file__ if running as script
+PROJECT_ROOT = os.path.join(CURRENT_DIR)
+sys.path.insert(0, PROJECT_ROOT)
+
+print("Project root added to sys.path:", PROJECT_ROOT)
 import pandas as pd
 from datetime import datetime, timedelta
-from ingestion import weather_client
 from src.ingestion.aqi_client_live import AQICNLiveClient
 from src.ingestion.openmeteo_historical_client import OpenMeteoHistoricalAQIClient
 from src.ingestion.openmeteo_weather_historical_client import OpenMeteoWeatherHistoricalClient
@@ -21,31 +29,42 @@ def merge_historical_data(city: str, token: str):
     """Fetch and merge historical pollutants + weather into a single dataframe"""
     logger.info(f"Fetching and merging historical data for {city}")
 
-    # --- Resolve station ---
+    # --- Resolve AQI station ---
     resolver = AQICNStationResolver(token=token, city=city)
     station = resolver.resolve()
     lat, lon = station["geo"]
 
+    # --- Date range for last 120 days ---
+    end_date_dt = datetime.utcnow()
+    start_date_dt = end_date_dt - timedelta(days=120)
+    # AQI client expects YYYY-MM-DD strings
+    start_date_str = start_date_dt.date().isoformat()
+    end_date_str = end_date_dt.date().isoformat()
+
     # --- Historical pollutants (AQI) ---
-    end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=120)  # last 4 months
-    pollutants_client = OpenMeteoHistoricalAQIClient(latitude=lat, longitude=lon,
-                                                     start_date=start_date, end_date=end_date)
+    pollutants_client = OpenMeteoHistoricalAQIClient(
+        latitude=lat,
+        longitude=lon,
+        start_date=start_date_str,
+        end_date=end_date_str
+    )
     pollutants_df = pd.DataFrame(pollutants_client.fetch())
     pollutants_df = flatten_dataframe(pollutants_df, "pollutants", "pollutants")
 
     # --- Historical weather ---
-    weather_client = OpenMeteoWeatherHistoricalClient(city=city, latitude=lat, longitude=lon)
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=120)
-    weather_df = pd.DataFrame(weather_client.fetch(start_date=start_date, end_date=end_date))
+    weather_client = OpenMeteoWeatherHistoricalClient(
+        latitude=lat,
+        longitude=lon,
+        city=city
+    )
+    weather_df = pd.DataFrame(weather_client.fetch(start_date=start_date_dt, end_date=end_date_dt))
     weather_df = flatten_dataframe(weather_df, "weather", "weather")
 
     # --- Ensure UTC timestamps ---
     pollutants_df["event_timestamp"] = pd.to_datetime(pollutants_df["event_timestamp"], utc=True)
     weather_df["event_timestamp"] = pd.to_datetime(weather_df["event_timestamp"], utc=True)
 
-    # --- Merge ---
+    # --- Merge on timestamp ---
     merged_df = pd.merge(pollutants_df, weather_df, on="event_timestamp", how="inner")
     logger.info(f"Merged historical data shape: {merged_df.shape}")
     return merged_df
@@ -55,7 +74,7 @@ def merge_live_data(city: str, token: str, weather_df: pd.DataFrame):
     logger.info(f"Fetching live AQI for {city}")
     live_client = AQICNLiveClient(city=city, token=token)
 
-    # Fetch live data with retries
+    # --- Fetch live data with retries ---
     for attempt in range(3):
         try:
             live_data = live_client.fetch()
@@ -68,7 +87,7 @@ def merge_live_data(city: str, token: str, weather_df: pd.DataFrame):
     live_df = pd.DataFrame([live_data])
     live_df = flatten_dataframe(live_df, "pollutants", "pollutants")
 
-    # Align closest weather timestamp
+    # --- Align closest weather timestamp ---
     weather_df["event_timestamp"] = pd.to_datetime(weather_df["event_timestamp"], utc=True)
     live_ts = pd.to_datetime(live_df["event_timestamp"].iloc[0], utc=True)
     closest_weather = weather_df.iloc[(weather_df["event_timestamp"] - live_ts).abs().argsort()[:1]]
