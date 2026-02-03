@@ -16,7 +16,7 @@ from src.utils.logger import get_logger
 
 # Step 3: Load env
 load_dotenv()
-TOKEN = "361cf32474f50ec4ff9f3f677392739e1bfd8384"  # or os.getenv("AQICN_TOKEN")
+TOKEN = "361cf32474f50ec4ff9f3f677392739e1bfd8384"
 CITY = "Karachi"
 
 # Logging
