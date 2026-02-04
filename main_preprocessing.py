@@ -1,86 +1,140 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
-from datetime import timezone
 from pymongo import MongoClient
+
 from src.ingestion.merge_data import merge_historical_data
+from src.preprocessing.data_cleaning import clean_data
 from src.preprocessing.feature_engineering import (
-    cap_outliers_iqr,
     create_time_features,
     create_pollutant_change,
     create_lags,
     create_rolling_stats,
-    create_targets,
-    scale_features
 )
+from src.preprocessing.target_engineering import create_future_targets
+from src.preprocessing.scaling import scale_features
 
-# ---------------- Constants ----------------
+# ============================================================
+# Configuration
+# ============================================================
+
 PROJECT_ROOT = os.getcwd()
 DATA_DIR = os.path.join(PROJECT_ROOT, "data/processed")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 CITY = "karachi"
 TOKEN = "361cf32474f50ec4ff9f3f677392739e1bfd8384"
-VERSION = "v1.0"
-FEATURE_SET_NAME = "aqi_features"
 
-POLLUTANT_FEATURES = ['pm25', 'pm10', 'co_pollutants', 'no2_pollutants', 'so2_pollutants', 'o3_pollutants']
-WEATHER_TIME_FEATURES = ["temperature", "humidity", "wind_speed", "wind_direction", "pressure", "precipitation", "hour", "day", "weekday", "month"]
+FEATURE_SET_NAME = "aqi_features"
+VERSION = "v2.0"   # bump version because logic changed
+
+POLLUTANT_FEATURES = [
+    "pm10", "co_pollutants",
+    "no2_pollutants", "so2_pollutants", "o3_pollutants"
+]
+
+
+WEATHER_FEATURES = [
+    "temperature", "humidity", "wind_speed",
+    "wind_direction", "pressure", "precipitation"
+]
+
 LAG_HOURS = [1, 3, 6, 12, 24]
 ROLLING_WINDOWS = [3, 6, 12]
 TARGET_HORIZONS = [24, 48, 72]
 
-# ---------------- Step 1: Fetch Historical Data ----------------
-df = merge_historical_data(city=CITY, token=TOKEN)
+TARGET_COL = "pm25"
 
-# ---------------- Step 2: Basic Cleaning & Column Selection ----------------
-columns_to_keep = [
-    "event_timestamp",
-    "pm25_pollutants", "pm10_pollutants", "no2_pollutants",
-    "so2_pollutants", "o3_pollutants", "co_pollutants",
-    "temperature_weather", "humidity_weather", "wind_speed_weather",
-    "wind_direction_weather", "pressure_weather", "precipitation_weather"
-]
-df = df[columns_to_keep].copy()
-df.rename(columns={
-    "pm25_pollutants": "pm25",
-    "pm10_pollutants": "pm10",
-    "temperature_weather": "temperature",
-    "humidity_weather": "humidity",
-    "wind_speed_weather": "wind_speed",
-    "wind_direction_weather": "wind_direction",
-    "pressure_weather": "pressure",
-    "precipitation_weather": "precipitation"
-}, inplace=True)
+# ============================================================
+# Step 1: Fetch raw historical data
+# ============================================================
 
-# ---------------- Step 3: Cap Outliers ----------------
-for f in ["pm10", "co_pollutants"]:
-    df[f] = cap_outliers_iqr(df[f])
+df_raw = merge_historical_data(city=CITY, token=TOKEN)
 
-# ---------------- Step 4: Feature Engineering ----------------
-df = create_time_features(df)
-df = create_pollutant_change(df, POLLUTANT_FEATURES)
-df = create_lags(df, POLLUTANT_FEATURES, LAG_HOURS)
-df = create_rolling_stats(df, POLLUTANT_FEATURES, ROLLING_WINDOWS)
-df = create_targets(df, "pm25", TARGET_HORIZONS)
-df = scale_features(df, POLLUTANT_FEATURES, WEATHER_TIME_FEATURES)
+# ============================================================
+# Step 2: Cleaning & canonical column names
+# ============================================================
 
-# ---------------- Step 5: Drop rows with missing target values ----------------
-target_cols = [f"pm25_t_plus_{h}h" for h in TARGET_HORIZONS]
+df_raw = clean_data(df_raw)
+
+# IMPORTANT:
+# Keep a RAW copy for target creation
+df_features = df_raw.copy()
+
+# ============================================================
+# Step 3: Feature engineering (NO TARGETS, NO SCALING)
+# ============================================================
+
+df_features = create_time_features(df_features)
+df_features = create_pollutant_change(df_features, POLLUTANT_FEATURES)
+df_features = create_lags(df_features, POLLUTANT_FEATURES, LAG_HOURS)
+df_features = create_rolling_stats(df_features, POLLUTANT_FEATURES, ROLLING_WINDOWS)
+
+# ============================================================
+# Step 4: Target engineering (RAW pm25 ONLY)
+# ============================================================
+
+df_targets = create_future_targets(
+    df=df_raw[[ "event_timestamp", TARGET_COL ]],
+    target_col=TARGET_COL,
+    horizons=TARGET_HORIZONS
+)
+
+# ============================================================
+# Step 5: Merge features + targets
+# ============================================================
+
+df = df_features.merge(
+    df_targets,
+    on="event_timestamp",
+    how="inner"
+)
+
+# Drop rows with missing future targets
+target_cols = [f"{TARGET_COL}_t_plus_{h}h" for h in TARGET_HORIZONS]
 df.dropna(subset=target_cols, inplace=True)
 df.reset_index(drop=True, inplace=True)
 
-# ---------------- Step 6: Save Locally ----------------
-feature_cols = [c for c in df.columns if c not in ["event_timestamp"] + target_cols]
-df.to_parquet(os.path.join(DATA_DIR, "aqi_features_v1.parquet"))
-pd.Series(feature_cols).to_json(os.path.join(DATA_DIR, "feature_columns_v1.json"))
+# ============================================================
+# Step 6: Scale FEATURES ONLY
+# ============================================================
 
-# ---------------- Step 7: Upload to MongoDB Feature Store ----------------
+TIME_FEATURES = ["hour", "weekday", "month", "is_weekend"]
+
+df, pollutant_scaler, weather_scaler = scale_features(
+    df=df,
+    pollutant_features=POLLUTANT_FEATURES,
+    weather_features=WEATHER_FEATURES + TIME_FEATURES
+)
+
+# ============================================================
+# Step 7: Persist locally
+# ============================================================
+
+feature_cols = [
+    c for c in df.columns
+    if c not in ["event_timestamp"] + target_cols
+]
+
+df.to_parquet(
+    os.path.join(DATA_DIR, f"aqi_features_{VERSION}.parquet"),
+    index=False
+)
+
+pd.Series(feature_cols).to_json(
+    os.path.join(DATA_DIR, f"feature_columns_{VERSION}.json")
+)
+
+# ============================================================
+# Step 8: Upload to MongoDB feature store
+# ============================================================
+
 client = MongoClient("mongodb://localhost:27017/")
 db = client["aqi_feature_store"]
-collection = db["features_v1"]
+collection = db["features"]
 
 records = df.to_dict(orient="records")
+
 for r in records:
     r.update({
         "feature_set_name": FEATURE_SET_NAME,
@@ -88,7 +142,14 @@ for r in records:
         "created_at": datetime.now(timezone.utc)
     })
 
-collection.delete_many({"feature_set_name": FEATURE_SET_NAME, "version": VERSION})
+collection.delete_many({
+    "feature_set_name": FEATURE_SET_NAME,
+    "version": VERSION
+})
+
 collection.insert_many(records)
 
-print(f"[INFO] Inserted {len(records)} records into MongoDB feature store, version={VERSION}")
+print(
+    f"[INFO] Inserted {len(records)} records "
+    f"into feature store | version={VERSION}"
+)
